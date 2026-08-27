@@ -98,7 +98,7 @@ function detectLanguage(text) {
 async function translateWithRetry(text, source, target, attempt = 1) {
   console.log(`Attempt ${attempt} - Translating [${source}->${target}]`);
   
-  // Try different services in order - Google first as it's most reliable
+  // Try different services in order
   const services = [
     () => translateGoogle(text, source, target),
     () => translateLibreTranslate(text, source, target),
@@ -109,7 +109,7 @@ async function translateWithRetry(text, source, target, attempt = 1) {
   for (let i = 0; i < services.length; i++) {
     try {
       const result = await services[i]();
-      if (result) {
+      if (result && result.length > 0) {
         console.log(`✅ Translation successful using service ${i + 1}`);
         return result;
       }
@@ -142,19 +142,22 @@ async function translateGoogle(text, source, target) {
   
   if (sourceLang === targetLang) return null;
   
+  // For Chinese translations, use a different approach to get full text
   const url = 'https://translate.googleapis.com/translate_a/single';
   const params = new URLSearchParams({
     client: 'gtx',
     sl: sourceLang,
     tl: targetLang,
     dt: 't',
+    dt: 'at',  // Added for better translation quality
+    dj: '1',   // JSON format
     q: text
   });
 
   try {
     console.log(`Google Translate [${sourceLang}->${targetLang}]`);
     const response = await fetch(`${url}?${params}`, {
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(10000) // Increased timeout for longer texts
     });
     
     if (!response.ok) {
@@ -163,14 +166,55 @@ async function translateGoogle(text, source, target) {
     }
     
     const data = await response.json();
-    if (data && data[0] && data[0][0] && data[0][0][0]) {
-      const translated = data[0][0][0];
-      if (translated && translated.toLowerCase() !== text.toLowerCase()) {
-        console.log(`Google Translate: "${translated}"`);
-        return translated;
-      }
-      return null;
+    
+    // Handle different response formats
+    let translated = null;
+    
+    // Try format 1: Array format
+    if (Array.isArray(data) && data[0] && data[0][0] && data[0][0][0]) {
+      translated = data[0][0][0];
+    } 
+    // Try format 2: Object format with sentences
+    else if (data.sentences && Array.isArray(data.sentences)) {
+      translated = data.sentences.map(s => s.trans || s).join('');
     }
+    // Try format 3: Direct text
+    else if (data.text) {
+      translated = data.text;
+    }
+    
+    if (translated && translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
+      console.log(`Google Translate: "${translated}"`);
+      return translated;
+    }
+    
+    // If translation failed with the first method, try a simpler URL
+    if (translated === null || translated.length === 0) {
+      console.log('Google Translate first method failed, trying alternative...');
+      const simpleParams = new URLSearchParams({
+        client: 'gtx',
+        sl: sourceLang,
+        tl: targetLang,
+        dt: 't',
+        q: text
+      });
+      
+      const simpleResponse = await fetch(`${url}?${simpleParams}`, {
+        signal: AbortSignal.timeout(10000)
+      });
+      
+      if (simpleResponse.ok) {
+        const simpleData = await simpleResponse.json();
+        if (Array.isArray(simpleData) && simpleData[0] && simpleData[0][0] && simpleData[0][0][0]) {
+          translated = simpleData[0][0][0];
+          if (translated && translated.length > 0) {
+            console.log(`Google Translate (alt): "${translated}"`);
+            return translated;
+          }
+        }
+      }
+    }
+    
     return null;
   } catch (err) {
     console.log('Google Translate error:', err.message);
@@ -210,7 +254,7 @@ async function translateLibreTranslate(text, source, target) {
           target: targetLang,
           format: 'text'
         }),
-        signal: AbortSignal.timeout(8000)
+        signal: AbortSignal.timeout(10000)
       });
 
       if (!response.ok) {
@@ -219,7 +263,8 @@ async function translateLibreTranslate(text, source, target) {
       }
       
       const data = await response.json();
-      if (data.translatedText && data.translatedText.toLowerCase() !== text.toLowerCase()) {
+      if (data.translatedText && data.translatedText.length > 0 && 
+          data.translatedText.toLowerCase() !== text.toLowerCase()) {
         console.log(`LibreTranslate: "${data.translatedText}"`);
         return data.translatedText;
       }
@@ -239,7 +284,7 @@ async function translateMyMemory(text, source, target) {
   try {
     console.log(`MyMemory [${source}->${target}]`);
     const response = await fetch(url, {
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(10000)
     });
     
     if (response.status === 429) {
@@ -254,6 +299,7 @@ async function translateMyMemory(text, source, target) {
     
     const data = await response.json();
     if (data?.responseData?.translatedText && 
+        data.responseData.translatedText.length > 0 &&
         data.responseData.translatedText.toLowerCase() !== text.toLowerCase()) {
       console.log(`MyMemory: "${data.responseData.translatedText}"`);
       return data.responseData.translatedText;
@@ -273,5 +319,6 @@ app.listen(port, () => {
   console.log('  1. Google Translate (unofficial)');
   console.log('  2. LibreTranslate');
   console.log('  3. MyMemory');
+  console.log('📝 Enhanced Chinese translation support');
   console.log('=============================');
 });
