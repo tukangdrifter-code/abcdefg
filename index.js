@@ -46,7 +46,11 @@ async function handleEvent(event) {
 
     const messages = translations
       .filter(Boolean)
-      .map(t => ({ type: 'text', text: t }));
+      .map(t => {
+        // Make sure we have a string, not an object
+        const textStr = typeof t === 'string' ? t : String(t);
+        return { type: 'text', text: textStr };
+      });
 
     if (messages.length === 0) {
       await client.replyMessage(event.replyToken, {
@@ -109,7 +113,7 @@ async function translateWithRetry(text, source, target, attempt = 1) {
   for (let i = 0; i < services.length; i++) {
     try {
       const result = await services[i]();
-      if (result && result.length > 0) {
+      if (result && typeof result === 'string' && result.length > 0) {
         console.log(`✅ Translation successful using service ${i + 1}`);
         return result;
       }
@@ -142,22 +146,19 @@ async function translateGoogle(text, source, target) {
   
   if (sourceLang === targetLang) return null;
   
-  // For Chinese translations, use a different approach to get full text
   const url = 'https://translate.googleapis.com/translate_a/single';
   const params = new URLSearchParams({
     client: 'gtx',
     sl: sourceLang,
     tl: targetLang,
     dt: 't',
-    dt: 'at',  // Added for better translation quality
-    dj: '1',   // JSON format
     q: text
   });
 
   try {
     console.log(`Google Translate [${sourceLang}->${targetLang}]`);
     const response = await fetch(`${url}?${params}`, {
-      signal: AbortSignal.timeout(10000) // Increased timeout for longer texts
+      signal: AbortSignal.timeout(10000)
     });
     
     if (!response.ok) {
@@ -167,57 +168,109 @@ async function translateGoogle(text, source, target) {
     
     const data = await response.json();
     
-    // Handle different response formats
+    // Debug: log what we got
+    console.log('Google Translate response type:', typeof data);
+    console.log('Google Translate response preview:', JSON.stringify(data).substring(0, 200));
+    
     let translated = null;
     
-    // Try format 1: Array format
-    if (Array.isArray(data) && data[0] && data[0][0] && data[0][0][0]) {
-      translated = data[0][0][0];
+    // Handle different response formats
+    if (Array.isArray(data)) {
+      // Format 1: [[["translated","source",...]]]
+      if (data[0] && Array.isArray(data[0]) && data[0][0] && Array.isArray(data[0][0])) {
+        translated = data[0].map(item => item[0]).join('');
+      }
+      // Format 2: [[["translated",...]]]
+      else if (data[0] && Array.isArray(data[0]) && data[0][0]) {
+        if (typeof data[0][0] === 'string') {
+          translated = data[0][0];
+        } else if (Array.isArray(data[0][0]) && data[0][0][0]) {
+          translated = data[0].map(item => item[0]).join('');
+        }
+      }
+      // Format 3: Just array of strings
+      else if (typeof data[0] === 'string') {
+        translated = data.join('');
+      }
     } 
-    // Try format 2: Object format with sentences
-    else if (data.sentences && Array.isArray(data.sentences)) {
-      translated = data.sentences.map(s => s.trans || s).join('');
-    }
-    // Try format 3: Direct text
-    else if (data.text) {
-      translated = data.text;
+    // Format 4: Object with sentences
+    else if (data && typeof data === 'object') {
+      if (data.sentences && Array.isArray(data.sentences)) {
+        translated = data.sentences.map(s => {
+          if (typeof s === 'string') return s;
+          if (s.trans) return s.trans;
+          if (s.translation) return s.translation;
+          return '';
+        }).join('');
+      } else if (data.text) {
+        translated = data.text;
+      } else if (data.translatedText) {
+        translated = data.translatedText;
+      }
     }
     
-    if (translated && translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
-      console.log(`Google Translate: "${translated}"`);
-      return translated;
+    // Clean up the translation
+    if (translated && typeof translated === 'string' && translated.length > 0) {
+      // Remove [object Object] if it appears
+      translated = translated.replace(/\[object Object\]/g, '').trim();
+      
+      if (translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
+        console.log(`Google Translate: "${translated}"`);
+        return translated;
+      }
     }
     
-    // If translation failed with the first method, try a simpler URL
-    if (translated === null || translated.length === 0) {
-      console.log('Google Translate first method failed, trying alternative...');
-      const simpleParams = new URLSearchParams({
-        client: 'gtx',
-        sl: sourceLang,
-        tl: targetLang,
-        dt: 't',
-        q: text
-      });
+    // Try fallback with different parameters
+    console.log('Google Translate first attempt failed, trying alternative...');
+    return translateGoogleFallback(text, sourceLang, targetLang);
+    
+  } catch (err) {
+    console.log('Google Translate error:', err.message);
+    return translateGoogleFallback(text, sourceLang, targetLang);
+  }
+}
+
+// Fallback method for Google Translate
+async function translateGoogleFallback(text, sourceLang, targetLang) {
+  try {
+    const url = 'https://translate.googleapis.com/translate_a/single';
+    const params = new URLSearchParams({
+      client: 'gtx',
+      sl: sourceLang,
+      tl: targetLang,
+      dt: 't',
+      q: text
+    });
+    
+    const response = await fetch(`${url}?${params}`, {
+      signal: AbortSignal.timeout(10000)
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
       
-      const simpleResponse = await fetch(`${url}?${simpleParams}`, {
-        signal: AbortSignal.timeout(10000)
-      });
-      
-      if (simpleResponse.ok) {
-        const simpleData = await simpleResponse.json();
-        if (Array.isArray(simpleData) && simpleData[0] && simpleData[0][0] && simpleData[0][0][0]) {
-          translated = simpleData[0][0][0];
-          if (translated && translated.length > 0) {
-            console.log(`Google Translate (alt): "${translated}"`);
-            return translated;
+      // Try to extract text from any format
+      if (data && typeof data === 'object') {
+        const jsonStr = JSON.stringify(data);
+        // Try to find translated text in the JSON
+        const matches = jsonStr.match(/"([^"]+)"|'([^']+)'/g);
+        if (matches && matches.length > 0) {
+          // Find the longest string that might be translation
+          const strings = matches.map(m => m.replace(/["']/g, '')).filter(s => s.length > 1);
+          if (strings.length > 0) {
+            // Get the longest string (likely the translation)
+            const translated = strings.reduce((a, b) => a.length > b.length ? a : b);
+            if (translated && translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
+              console.log(`Google Translate fallback: "${translated}"`);
+              return translated.replace(/\[object Object\]/g, '').trim();
+            }
           }
         }
       }
     }
-    
     return null;
   } catch (err) {
-    console.log('Google Translate error:', err.message);
+    console.log('Google Translate fallback error:', err.message);
     return null;
   }
 }
@@ -235,7 +288,6 @@ async function translateLibreTranslate(text, source, target) {
   
   if (sourceLang === targetLang) return null;
   
-  // Try multiple LibreTranslate instances
   const instances = [
     'https://libretranslate.com/translate',
     'https://translate.mentality.rip/translate',
@@ -263,10 +315,11 @@ async function translateLibreTranslate(text, source, target) {
       }
       
       const data = await response.json();
-      if (data.translatedText && data.translatedText.length > 0 && 
+      if (data.translatedText && typeof data.translatedText === 'string' && 
+          data.translatedText.length > 0 && 
           data.translatedText.toLowerCase() !== text.toLowerCase()) {
         console.log(`LibreTranslate: "${data.translatedText}"`);
-        return data.translatedText;
+        return data.translatedText.replace(/\[object Object\]/g, '').trim();
       }
     } catch (err) {
       console.log(`LibreTranslate instance failed:`, err.message);
@@ -299,10 +352,11 @@ async function translateMyMemory(text, source, target) {
     
     const data = await response.json();
     if (data?.responseData?.translatedText && 
+        typeof data.responseData.translatedText === 'string' &&
         data.responseData.translatedText.length > 0 &&
         data.responseData.translatedText.toLowerCase() !== text.toLowerCase()) {
       console.log(`MyMemory: "${data.responseData.translatedText}"`);
-      return data.responseData.translatedText;
+      return data.responseData.translatedText.replace(/\[object Object\]/g, '').trim();
     }
     return null;
   } catch (err) {
@@ -315,10 +369,7 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('=== LINE TRANSLATOR BOT ===');
   console.log(`✅ Server running on port ${port}`);
-  console.log('🔄 Using multiple translation services:');
-  console.log('  1. Google Translate (unofficial)');
-  console.log('  2. LibreTranslate');
-  console.log('  3. MyMemory');
-  console.log('📝 Enhanced Chinese translation support');
+  console.log('🔄 Using multiple translation services with improved text extraction');
+  console.log('📝 Fixed [object Object] bug');
   console.log('=============================');
 });
