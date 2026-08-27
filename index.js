@@ -39,6 +39,7 @@ async function handleEvent(event) {
     
     const targets = ['en', 'zh-TW', 'id'].filter(code => code !== detected);
     
+    // Get translations with retry logic
     const translations = await Promise.all(
       targets.map(target => translateWithRetry(text, detected, target))
     );
@@ -46,6 +47,7 @@ async function handleEvent(event) {
     const messages = translations
       .filter(Boolean)
       .map(t => {
+        // Make sure we have a string, not an object
         const textStr = typeof t === 'string' ? t : String(t);
         return { type: 'text', text: textStr };
       });
@@ -96,17 +98,18 @@ function detectLanguage(text) {
   return hits > 0 ? 'id' : 'en';
 }
 
+// Try multiple translation services with retry
 async function translateWithRetry(text, source, target, attempt = 1) {
   console.log(`Attempt ${attempt} - Translating [${source}->${target}]`);
   
   // Try different services in order
   const services = [
-    () => translateGoogle2(text, source, target),
     () => translateGoogle(text, source, target),
     () => translateLibreTranslate(text, source, target),
     () => translateMyMemory(text, source, target),
   ];
   
+  // Try each service
   for (let i = 0; i < services.length; i++) {
     try {
       const result = await services[i]();
@@ -119,9 +122,10 @@ async function translateWithRetry(text, source, target, attempt = 1) {
     }
   }
   
+  // If all services fail, try one more time with a delay
   if (attempt < 3) {
     console.log(`Retrying translation (attempt ${attempt + 1})...`);
-    await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
+    await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
     return translateWithRetry(text, source, target, attempt + 1);
   }
   
@@ -129,83 +133,7 @@ async function translateWithRetry(text, source, target, attempt = 1) {
   return null;
 }
 
-// Service 1: Google Translate with different endpoint (more reliable)
-async function translateGoogle2(text, source, target) {
-  const langMap = {
-    'en': 'en',
-    'zh-TW': 'zh-CN',
-    'id': 'id'
-  };
-  
-  const sourceLang = langMap[source] || source;
-  const targetLang = langMap[target] || target;
-  
-  if (sourceLang === targetLang) return null;
-  
-  // Use a different Google Translate endpoint
-  const url = 'https://translate.googleapis.com/translate_a/single';
-  const params = new URLSearchParams({
-    client: 'webapp',
-    sl: sourceLang,
-    tl: targetLang,
-    hl: 'zh-CN',
-    dt: 't',
-    dt: 'bd',
-    dt: 'ex',
-    dt: 'ld',
-    dt: 'md',
-    dt: 'qca',
-    dt: 'rw',
-    dt: 'rm',
-    dt: 'ss',
-    dt: 'sos',
-    dt: 'gt',
-    q: text
-  });
-
-  try {
-    console.log(`Google Translate v2 [${sourceLang}->${targetLang}]`);
-    const response = await fetch(`${url}?${params}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-      },
-      signal: AbortSignal.timeout(15000)
-    });
-    
-    if (!response.ok) {
-      console.log('Google Translate v2 HTTP error:', response.status);
-      return null;
-    }
-    
-    const data = await response.json();
-    
-    // Parse the response
-    let translated = '';
-    if (Array.isArray(data) && data[0]) {
-      for (const part of data[0]) {
-        if (Array.isArray(part) && part[0]) {
-          translated += part[0];
-        }
-      }
-    }
-    
-    if (translated && translated.length > 0) {
-      translated = translated.replace(/\[object Object\]/g, '').trim();
-      if (translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
-        console.log(`Google Translate v2: "${translated}"`);
-        return translated;
-      }
-    }
-    
-    return null;
-  } catch (err) {
-    console.log('Google Translate v2 error:', err.message);
-    return null;
-  }
-}
-
-// Service 2: Google Translate (original)
+// Service 1: Google Translate (Unofficial, most reliable)
 async function translateGoogle(text, source, target) {
   const langMap = {
     'en': 'en',
@@ -240,36 +168,114 @@ async function translateGoogle(text, source, target) {
     
     const data = await response.json();
     
+    // Debug: log what we got
+    console.log('Google Translate response type:', typeof data);
+    console.log('Google Translate response preview:', JSON.stringify(data).substring(0, 200));
+    
     let translated = null;
     
+    // Handle different response formats
     if (Array.isArray(data)) {
+      // Format 1: [[["translated","source",...]]]
       if (data[0] && Array.isArray(data[0]) && data[0][0] && Array.isArray(data[0][0])) {
         translated = data[0].map(item => item[0]).join('');
-      } else if (data[0] && Array.isArray(data[0]) && data[0][0]) {
+      }
+      // Format 2: [[["translated",...]]]
+      else if (data[0] && Array.isArray(data[0]) && data[0][0]) {
         if (typeof data[0][0] === 'string') {
           translated = data[0][0];
         } else if (Array.isArray(data[0][0]) && data[0][0][0]) {
           translated = data[0].map(item => item[0]).join('');
         }
       }
+      // Format 3: Just array of strings
+      else if (typeof data[0] === 'string') {
+        translated = data.join('');
+      }
+    } 
+    // Format 4: Object with sentences
+    else if (data && typeof data === 'object') {
+      if (data.sentences && Array.isArray(data.sentences)) {
+        translated = data.sentences.map(s => {
+          if (typeof s === 'string') return s;
+          if (s.trans) return s.trans;
+          if (s.translation) return s.translation;
+          return '';
+        }).join('');
+      } else if (data.text) {
+        translated = data.text;
+      } else if (data.translatedText) {
+        translated = data.translatedText;
+      }
     }
     
+    // Clean up the translation
     if (translated && typeof translated === 'string' && translated.length > 0) {
+      // Remove [object Object] if it appears
       translated = translated.replace(/\[object Object\]/g, '').trim();
+      
       if (translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
         console.log(`Google Translate: "${translated}"`);
         return translated;
       }
     }
     
-    return null;
+    // Try fallback with different parameters
+    console.log('Google Translate first attempt failed, trying alternative...');
+    return translateGoogleFallback(text, sourceLang, targetLang);
+    
   } catch (err) {
     console.log('Google Translate error:', err.message);
+    return translateGoogleFallback(text, sourceLang, targetLang);
+  }
+}
+
+// Fallback method for Google Translate
+async function translateGoogleFallback(text, sourceLang, targetLang) {
+  try {
+    const url = 'https://translate.googleapis.com/translate_a/single';
+    const params = new URLSearchParams({
+      client: 'gtx',
+      sl: sourceLang,
+      tl: targetLang,
+      dt: 't',
+      q: text
+    });
+    
+    const response = await fetch(`${url}?${params}`, {
+      signal: AbortSignal.timeout(10000)
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      
+      // Try to extract text from any format
+      if (data && typeof data === 'object') {
+        const jsonStr = JSON.stringify(data);
+        // Try to find translated text in the JSON
+        const matches = jsonStr.match(/"([^"]+)"|'([^']+)'/g);
+        if (matches && matches.length > 0) {
+          // Find the longest string that might be translation
+          const strings = matches.map(m => m.replace(/["']/g, '')).filter(s => s.length > 1);
+          if (strings.length > 0) {
+            // Get the longest string (likely the translation)
+            const translated = strings.reduce((a, b) => a.length > b.length ? a : b);
+            if (translated && translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
+              console.log(`Google Translate fallback: "${translated}"`);
+              return translated.replace(/\[object Object\]/g, '').trim();
+            }
+          }
+        }
+      }
+    }
+    return null;
+  } catch (err) {
+    console.log('Google Translate fallback error:', err.message);
     return null;
   }
 }
 
-// Service 3: LibreTranslate
+// Service 2: LibreTranslate
 async function translateLibreTranslate(text, source, target) {
   const langMap = {
     'en': 'en',
@@ -284,6 +290,7 @@ async function translateLibreTranslate(text, source, target) {
   
   const instances = [
     'https://libretranslate.com/translate',
+    'https://translate.mentality.rip/translate',
   ];
   
   for (const url of instances) {
@@ -292,10 +299,7 @@ async function translateLibreTranslate(text, source, target) {
       
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           q: text,
           source: sourceLang,
@@ -325,10 +329,10 @@ async function translateLibreTranslate(text, source, target) {
   return null;
 }
 
-// Service 4: MyMemory
+// Service 3: MyMemory
 async function translateMyMemory(text, source, target) {
   const langpair = `${source}|${target}`;
-  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langpair)}&de=demo@example.com`;
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langpair)}`;
 
   try {
     console.log(`MyMemory [${source}->${target}]`);
@@ -365,10 +369,7 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('=== LINE TRANSLATOR BOT ===');
   console.log(`✅ Server running on port ${port}`);
-  console.log('🔄 Using translation services:');
-  console.log('  1. Google Translate v2 (Webapp endpoint)');
-  console.log('  2. Google Translate (GTX endpoint)');
-  console.log('  3. LibreTranslate');
-  console.log('  4. MyMemory');
+  console.log('🔄 Using multiple translation services with improved text extraction');
+  console.log('📝 Fixed [object Object] bug');
   console.log('=============================');
 });
