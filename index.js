@@ -99,8 +99,9 @@ function detectLanguage(text) {
 async function translateWithRetry(text, source, target, attempt = 1) {
   console.log(`Attempt ${attempt} - Translating [${source}->${target}]`);
   
+  // Try different services in order
   const services = [
-    () => translateDeepL(text, source, target),
+    () => translateGoogle2(text, source, target),
     () => translateGoogle(text, source, target),
     () => translateLibreTranslate(text, source, target),
     () => translateMyMemory(text, source, target),
@@ -120,7 +121,7 @@ async function translateWithRetry(text, source, target, attempt = 1) {
   
   if (attempt < 3) {
     console.log(`Retrying translation (attempt ${attempt + 1})...`);
-    await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+    await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
     return translateWithRetry(text, source, target, attempt + 1);
   }
   
@@ -128,76 +129,83 @@ async function translateWithRetry(text, source, target, attempt = 1) {
   return null;
 }
 
-// Service 1: DeepL (Most accurate, free tier available)
-async function translateDeepL(text, source, target) {
-  // DeepL language codes
+// Service 1: Google Translate with different endpoint (more reliable)
+async function translateGoogle2(text, source, target) {
   const langMap = {
-    'en': 'EN',
-    'zh-TW': 'ZH',  // DeepL uses ZH for Chinese
-    'id': 'ID'
+    'en': 'en',
+    'zh-TW': 'zh-CN',
+    'id': 'id'
   };
   
-  const sourceLang = langMap[source] || source.toUpperCase();
-  const targetLang = langMap[target] || target.toUpperCase();
+  const sourceLang = langMap[source] || source;
+  const targetLang = langMap[target] || target;
   
   if (sourceLang === targetLang) return null;
   
-  // Using DeepL's free API (no API key required for basic usage)
-  // But we'll try multiple free endpoints
-  const endpoints = [
-    'https://api-free.deepl.com/v2/translate',
-    'https://api.deepl.com/v2/translate',
-  ];
-  
-  for (const url of endpoints) {
-    try {
-      console.log(`DeepL [${sourceLang}->${targetLang}] via ${url}`);
-      
-      const params = new URLSearchParams({
-        text: text,
-        source_lang: sourceLang,
-        target_lang: targetLang,
-        tag_handling: 'html',
-        split_sentences: '1',
-      });
-      
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: params.toString(),
-        signal: AbortSignal.timeout(10000)
-      });
+  // Use a different Google Translate endpoint
+  const url = 'https://translate.googleapis.com/translate_a/single';
+  const params = new URLSearchParams({
+    client: 'webapp',
+    sl: sourceLang,
+    tl: targetLang,
+    hl: 'zh-CN',
+    dt: 't',
+    dt: 'bd',
+    dt: 'ex',
+    dt: 'ld',
+    dt: 'md',
+    dt: 'qca',
+    dt: 'rw',
+    dt: 'rm',
+    dt: 'ss',
+    dt: 'sos',
+    dt: 'gt',
+    q: text
+  });
 
-      if (response.status === 456) {
-        console.log('DeepL quota exceeded, trying next service');
-        return null;
-      }
-      
-      if (!response.ok) {
-        console.log(`DeepL HTTP error: ${response.status}`);
-        continue;
-      }
-      
-      const data = await response.json();
-      
-      if (data.translations && data.translations.length > 0) {
-        const translated = data.translations[0].text;
-        if (translated && translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
-          console.log(`DeepL: "${translated}"`);
-          return translated;
+  try {
+    console.log(`Google Translate v2 [${sourceLang}->${targetLang}]`);
+    const response = await fetch(`${url}?${params}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(15000)
+    });
+    
+    if (!response.ok) {
+      console.log('Google Translate v2 HTTP error:', response.status);
+      return null;
+    }
+    
+    const data = await response.json();
+    
+    // Parse the response
+    let translated = '';
+    if (Array.isArray(data) && data[0]) {
+      for (const part of data[0]) {
+        if (Array.isArray(part) && part[0]) {
+          translated += part[0];
         }
       }
-    } catch (err) {
-      console.log(`DeepL instance failed:`, err.message);
     }
+    
+    if (translated && translated.length > 0) {
+      translated = translated.replace(/\[object Object\]/g, '').trim();
+      if (translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
+        console.log(`Google Translate v2: "${translated}"`);
+        return translated;
+      }
+    }
+    
+    return null;
+  } catch (err) {
+    console.log('Google Translate v2 error:', err.message);
+    return null;
   }
-  
-  return null;
 }
 
-// Service 2: Google Translate (Unofficial, good for Chinese)
+// Service 2: Google Translate (original)
 async function translateGoogle(text, source, target) {
   const langMap = {
     'en': 'en',
@@ -243,27 +251,11 @@ async function translateGoogle(text, source, target) {
         } else if (Array.isArray(data[0][0]) && data[0][0][0]) {
           translated = data[0].map(item => item[0]).join('');
         }
-      } else if (typeof data[0] === 'string') {
-        translated = data.join('');
-      }
-    } else if (data && typeof data === 'object') {
-      if (data.sentences && Array.isArray(data.sentences)) {
-        translated = data.sentences.map(s => {
-          if (typeof s === 'string') return s;
-          if (s.trans) return s.trans;
-          if (s.translation) return s.translation;
-          return '';
-        }).join('');
-      } else if (data.text) {
-        translated = data.text;
-      } else if (data.translatedText) {
-        translated = data.translatedText;
       }
     }
     
     if (translated && typeof translated === 'string' && translated.length > 0) {
       translated = translated.replace(/\[object Object\]/g, '').trim();
-      
       if (translated.length > 0 && translated.toLowerCase() !== text.toLowerCase()) {
         console.log(`Google Translate: "${translated}"`);
         return translated;
@@ -292,7 +284,6 @@ async function translateLibreTranslate(text, source, target) {
   
   const instances = [
     'https://libretranslate.com/translate',
-    'https://translate.mentality.rip/translate',
   ];
   
   for (const url of instances) {
@@ -301,7 +292,10 @@ async function translateLibreTranslate(text, source, target) {
       
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0'
+        },
         body: JSON.stringify({
           q: text,
           source: sourceLang,
@@ -334,7 +328,7 @@ async function translateLibreTranslate(text, source, target) {
 // Service 4: MyMemory
 async function translateMyMemory(text, source, target) {
   const langpair = `${source}|${target}`;
-  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langpair)}`;
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langpair)}&de=demo@example.com`;
 
   try {
     console.log(`MyMemory [${source}->${target}]`);
@@ -371,9 +365,9 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('=== LINE TRANSLATOR BOT ===');
   console.log(`✅ Server running on port ${port}`);
-  console.log('🔄 Using translation services (ordered by accuracy):');
-  console.log('  1. DeepL (Most accurate) ⭐');
-  console.log('  2. Google Translate (Unofficial)');
+  console.log('🔄 Using translation services:');
+  console.log('  1. Google Translate v2 (Webapp endpoint)');
+  console.log('  2. Google Translate (GTX endpoint)');
   console.log('  3. LibreTranslate');
   console.log('  4. MyMemory');
   console.log('=============================');
