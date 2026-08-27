@@ -1,107 +1,93 @@
-// LINE Group Auto-Translator Bot
-// Translates between Traditional Chinese (zh-TW), English (en), and Indonesian (id).
-// Whichever language a message is written in, the bot replies with the other two.
-//
-// Free stack:
-//  - LINE Messaging API (free for this use case)
-//  - MyMemory Translation API (free, no signup, no API key)
-//  - franc-min (offline language guesser, used only to tell English apart from Indonesian)
-
-const express = require("express");
-const line = require("@line/bot-sdk");
-const axios = require("axios");
-const { franc } = require("franc-min");
+const express = require('express');
+const line = require('@line/bot-sdk');
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const MODEL = 'claude-haiku-4-5-20251001'; // fast + cheap, plenty for translation
+
 const app = express();
-const client = new line.messagingApi.MessagingApiClient({
-  channelAccessToken: config.channelAccessToken,
-});
+const client = new line.Client(config);
 
-// ---- Language detection -----------------------------------------------
+// Health check so Render doesn't think the service is down
+app.get('/', (req, res) => res.send('LINE translator bot is running'));
 
-// Returns one of "zh-TW", "en", "id"
-function detectLanguage(text) {
-  // 1) If it contains any CJK ideograph, treat it as Chinese.
-  const hasChinese = /[\u4e00-\u9fff]/.test(text);
-  if (hasChinese) return "zh-TW";
-
-  // 2) Otherwise decide between English and Indonesian.
-  //    franc, restricted to just these two candidates, is quite reliable.
-  const guess = franc(text, { only: ["eng", "ind"] });
-  if (guess === "ind") return "id";
-  return "en"; // default / fallback, including "und" (undetermined) on short text
-}
-
-// ---- Translation --------------------------------------------------------
-
-// MyMemory language codes: zh-TW, en, id
-async function translate(text, sourceLang, targetLang) {
-  const params = {
-    q: text,
-    langpair: `${sourceLang}|${targetLang}`,
-  };
-  // Optional: set MYMEMORY_EMAIL in your environment variables to raise
-  // MyMemory's free daily limit from ~5,000 to ~50,000 words/day. Any email works.
-  if (process.env.MYMEMORY_EMAIL) params.de = process.env.MYMEMORY_EMAIL;
-
-  const res = await axios.get("https://api.mymemory.translated.net/get", {
-    params,
-    timeout: 8000,
-  });
-  return res.data?.responseData?.translatedText || "(translation failed)";
-}
-
-const LANG_LABEL = {
-  "zh-TW": "🇹🇼 中文",
-  en: "🇬🇧 English",
-  id: "🇮🇩 Indonesia",
-};
-
-async function buildTranslationReply(text) {
-  const source = detectLanguage(text);
-  const targets = ["zh-TW", "en", "id"].filter((l) => l !== source);
-
-  const translations = await Promise.all(
-    targets.map((t) => translate(text, source, t))
+app.post('/webhook', line.middleware(config), (req, res) => {
+  // Respond to LINE immediately, then do the work
+  res.status(200).end();
+  Promise.all((req.body.events || []).map(handleEvent)).catch((err) =>
+    console.error('handleEvent error:', err)
   );
-
-  return targets
-    .map((lang, i) => `${LANG_LABEL[lang]}: ${translations[i]}`)
-    .join("\n");
-}
-
-// ---- Webhook --------------------------------------------------------------
-
-app.post("/webhook", line.middleware(config), async (req, res) => {
-  res.status(200).end(); // ack LINE immediately
-
-  const events = req.body.events || [];
-  for (const event of events) {
-    try {
-      if (event.type !== "message" || event.message.type !== "text") continue;
-
-      const text = event.message.text.trim();
-      if (!text) continue;
-
-      const replyText = await buildTranslationReply(text);
-
-      await client.replyMessage({
-        replyToken: event.replyToken,
-        messages: [{ type: "text", text: replyText }],
-      });
-    } catch (err) {
-      console.error("Error handling event:", err?.response?.data || err.message);
-    }
-  }
 });
 
-// Simple health check so you can confirm the server is alive (e.g. on Render)
-app.get("/", (req, res) => res.send("LINE translator bot is running."));
+async function handleEvent(event) {
+  if (event.type !== 'message' || event.message.type !== 'text') return;
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+  const text = event.message.text.trim();
+  if (!text) return;
+
+  const messages = await translate(text);
+  if (!messages || messages.length === 0) return;
+
+  // replyMessage sends both bubbles back-to-back near-instantly, and is free
+  // (doesn't use your monthly push-message quota).
+  await client.replyMessage(event.replyToken, messages);
+}
+
+async function translate(text) {
+  const prompt = `Detect the language of this message. It will be one of: Traditional Chinese (zh-Hant), English (en), or Indonesian (id).
+
+Message: ${JSON.stringify(text)}
+
+Then translate it into the OTHER TWO languages from that list (not the detected one).
+
+Respond with ONLY raw JSON (no markdown fences, no commentary), in this exact shape:
+{"detected":"zh-Hant" or "en" or "id","en":"...translation or omitted if detected","zh-Hant":"...translation or omitted if detected","id":"...translation or omitted if detected"}
+
+Only include the two keys that are NOT the detected language.`;
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!resp.ok) {
+    console.error('Anthropic API error:', resp.status, await resp.text());
+    return null;
+  }
+
+  const data = await resp.json();
+  const raw = (data.content || []).map((c) => c.text || '').join('');
+  const clean = raw.replace(/```json|```/g, '').trim();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch (err) {
+    console.error('Failed to parse translation JSON:', clean);
+    return null;
+  }
+
+  // Fixed output order: English first (unless English was the input),
+  // then whichever of zh-Hant / id remains.
+  const order = ['en', 'zh-Hant', 'id'].filter((code) => code !== parsed.detected);
+
+  return order
+    .filter((code) => parsed[code])
+    .map((code) => ({ type: 'text', text: parsed[code] }));
+}
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Listening on port ${port}`));
