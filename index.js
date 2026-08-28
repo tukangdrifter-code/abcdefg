@@ -105,7 +105,7 @@ async function translateWithRetry(text, source, target, attempt = 1) {
 
   const services = [
     () => translateMyMemory(text, source, target),
-    () => translateLibreTranslate(text, source, target),
+    () => translateLingva(text, source, target),
     () => translateGoogle(text, source, target),
   ];
 
@@ -170,42 +170,43 @@ async function translateMyMemory(text, source, target) {
   }
 }
 
-// Service 2: LibreTranslate
-async function translateLibreTranslate(text, source, target) {
+// Service 2: Lingva Translate — an open-source, privacy-friendly frontend for
+// Google Translate, run by volunteers on several independent mirrors. Since
+// any single mirror can go down or start requiring a key (as libretranslate.com
+// now does), we try several different ones in order.
+async function translateLingva(text, source, target) {
   const langMap = { 'en': 'en', 'zh-TW': 'zh', 'id': 'id' };
   const sourceLang = langMap[source] || source;
   const targetLang = langMap[target] || target;
   if (sourceLang === targetLang) return null;
 
   const instances = [
-    'https://libretranslate.com/translate',
-    'https://translate.mentality.rip/translate',
+    'https://lingva.lunar.icu',
+    'https://translate.plausibility.cloud',
+    'https://lingva.esmailelbob.xyz',
+    'https://translate.datatunnel.xyz',
   ];
 
-  for (const url of instances) {
+  for (const base of instances) {
+    const url = `${base}/api/v1/${sourceLang}/${targetLang}/${encodeURIComponent(text)}`;
     try {
-      console.log(`LibreTranslate [${sourceLang}->${targetLang}] via ${url}`);
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: text, source: sourceLang, target: targetLang, format: 'text' }),
-        signal: AbortSignal.timeout(10000)
-      });
+      console.log(`Lingva [${sourceLang}->${targetLang}] via ${base}`);
+      const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
 
       if (!response.ok) {
-        console.log(`LibreTranslate HTTP error: ${response.status}`);
+        console.log(`Lingva HTTP error: ${response.status} (${base})`);
         continue;
       }
 
       const data = await response.json();
-      if (data.translatedText && typeof data.translatedText === 'string' &&
-          data.translatedText.length > 0 &&
-          data.translatedText.toLowerCase() !== text.toLowerCase()) {
-        console.log(`LibreTranslate: "${data.translatedText}"`);
-        return data.translatedText.replace(/\[object Object\]/g, '').trim();
+      if (data.translation && typeof data.translation === 'string' &&
+          data.translation.length > 0 &&
+          data.translation.toLowerCase() !== text.toLowerCase()) {
+        console.log(`Lingva: "${data.translation}"`);
+        return data.translation.trim();
       }
     } catch (err) {
-      console.log(`LibreTranslate instance failed:`, err.message);
+      console.log(`Lingva instance failed (${base}):`, err.message);
     }
   }
 
