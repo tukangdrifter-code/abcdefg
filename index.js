@@ -97,13 +97,13 @@ function detectLanguage(text) {
 }
 
 // Try multiple translation services with retry.
-// MyMemory goes FIRST now: with an email registered (MYMEMORY_EMAIL env var),
-// its quota is tied to that email rather than Render's shared outbound IP,
-// which makes it the most reliable option when many apps share the same IP.
+// DeepL goes FIRST — real official API with a genuine free quota, not a
+// scraped mirror. The others are only used if DeepL itself fails.
 async function translateWithRetry(text, source, target, attempt = 1) {
   console.log(`Attempt ${attempt} - Translating [${source}->${target}]`);
 
   const services = [
+    () => translateDeepL(text, source, target),
     () => translateMyMemory(text, source, target),
     () => translateLingva(text, source, target),
     () => translateGoogle(text, source, target),
@@ -121,9 +121,12 @@ async function translateWithRetry(text, source, target, attempt = 1) {
     }
   }
 
-  if (attempt < 3) {
+  // Reduced from 3 attempts to 2, with a longer gap between them — the old
+  // 3x-full-waterfall retry could fire ~30+ requests for a single message,
+  // which risked triggering rate limits on its own.
+  if (attempt < 2) {
     console.log(`Retrying translation (attempt ${attempt + 1})...`);
-    await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
+    await new Promise(resolve => setTimeout(resolve, 5000 * attempt));
     return translateWithRetry(text, source, target, attempt + 1);
   }
 
@@ -131,7 +134,58 @@ async function translateWithRetry(text, source, target, attempt = 1) {
   return null;
 }
 
-// Service 1: MyMemory (now first — most reliable when MYMEMORY_EMAIL is set)
+// Service 0: DeepL — official API, real quota (500,000 chars/month free),
+// not a scraped/community mirror. This is the primary translator now;
+// everything else only runs if DeepL itself is unavailable.
+async function translateDeepL(text, source, target) {
+  if (!process.env.DEEPL_API_KEY) return null;
+  if (source === target) return null;
+
+  // DeepL source codes are the base language, no variant needed.
+  const sourceMap = { 'en': 'EN', 'zh-TW': 'ZH', 'id': 'ID' };
+  // DeepL target codes: ZH-HANT for Traditional Chinese specifically,
+  // EN-US for English, ID for Indonesian.
+  const targetMap = { 'en': 'EN-US', 'zh-TW': 'ZH-HANT', 'id': 'ID' };
+
+  const sourceLang = sourceMap[source];
+  const targetLang = targetMap[target];
+  if (!sourceLang || !targetLang) return null;
+
+  try {
+    console.log(`DeepL [${sourceLang}->${targetLang}]`);
+    const response = await fetch('https://api-free.deepl.com/v2/translate', {
+      method: 'POST',
+      headers: {
+        'Authorization': `DeepL-Auth-Key ${process.env.DEEPL_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: [text],
+        source_lang: sourceLang,
+        target_lang: targetLang,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      console.log('DeepL HTTP error:', response.status);
+      return null;
+    }
+
+    const data = await response.json();
+    const translated = data?.translations?.[0]?.text;
+    if (translated && typeof translated === 'string' && translated.length > 0) {
+      console.log(`DeepL: "${translated}"`);
+      return translated.trim();
+    }
+    return null;
+  } catch (err) {
+    console.log('DeepL error:', err.message);
+    return null;
+  }
+}
+
+// Service 1: MyMemory (backup — most reliable when MYMEMORY_EMAIL is set)
 async function translateMyMemory(text, source, target) {
   const langpair = `${source}|${target}`;
   const params = new URLSearchParams({ q: text, langpair });
@@ -282,6 +336,6 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('=== LINE TRANSLATOR BOT ===');
   console.log(`✅ Server running on port ${port}`);
-  console.log('🔄 MyMemory first, LibreTranslate then Google as fallback');
+  console.log('🔄 DeepL primary, MyMemory/Lingva/Google as fallback');
   console.log('=============================');
 });
